@@ -1,0 +1,191 @@
+---
+title: "vetiver-r-api"
+---
+
+This is a Quarto website.
+
+To learn more about Quarto websites visit <https://quarto.org/docs/websites>.
+
+```{r loadPackages}
+# https://www.youtube.com/watch?v=oFQANK13-k4
+#! message: false
+library(readr)
+library(tidyverse)
+library(arrow)
+library(feather)
+library(tidymodels)
+library(lubridate)
+library(vetiver)
+library(pins)
+library(plumber)
+```
+
+```{r globals}
+S3_BUCKET_NAME=""
+MODELS_ROOT=""
+```
+
+```{r loadData}
+#! message: false
+# scooby_raw <- readr::read_csv("https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2021/2021-07-13/scoobydoo.csv")%>%
+#   dplyr::filter(
+#     !is.na(imdb),
+#     !purrr::is_null(imdb),
+#     imdb!="NULL",
+#     monster_real!="NULL"
+#   )%>%
+#   dplyr::mutate(
+#     year_aired=lubridate::year(date_aired),
+#     monster_real=as.factor(ifelse(monster_real, "real", "fake")),
+#     imdb=as.numeric(imdb)
+#   )%>%
+#   # dplyr::select(monster_real, year_aired, imdb, title)
+#   dplyr::select(monster_real, date_aired, year_aired, imdb)
+# 
+# write_feather(
+#   x = scooby_raw%>%
+#     dplyr::filter(year_aired %in% c(2018, 2019, 2020)), # scooby_raw
+#   path = "data/scooby-validation.arrow" #"data/scooby-do.arrow"
+# )
+
+scooby <- read_feather("data/scooby-do.arrow")
+```
+
+```{r}
+#! message: false
+svm_spec<-parsnip::svm_linear(mode = "classification")
+scooby_rec<-recipes::recipe(monster_real ~ year_aired + imdb, data=scooby)%>%
+  recipes::step_normalize(recipes::all_numeric_predictors())
+
+svm_fit<-workflows::workflow(scooby_rec, svm_spec)%>%
+  parsnip::fit(scooby)
+```
+
+# Version and deploy a model
+
+Create a deployable model object:
+
+```{r}
+v <- vetiver::vetiver_model(
+  model = svm_fit,
+  model_name = "scooby-doo"
+)
+```
+
+Version and share the model:
+
+```{r}
+#! eval: false
+model_board<-pins::board_s3(
+  bucket = S3_BUCKET_NAME,
+  prefix = MODELS_ROOT
+)
+model_board%>%vetiver::vetiver_pin_write(v)
+```
+
+Document the model: https://vetiver.rstudio.com/learn-more/model-card.html
+
+Deploy model as a REST API:
+
+```{r}
+plumber::pr()%>%
+  vetiver::vetiver_api(v, debug = TRUE)%>%
+  plumber::pr_run()
+```
+
+-   Deploy to Connect: https://rstudio.github.io/vetiver-r/dev/reference/vetiver_deploy_rsconnect.html
+
+-   Deploy via Docker (after creating plumber file via below code chunk)
+
+```{r}
+#! eval: false
+vetiver::vetiver_write_plumber(
+  board = model_board,
+  name = "scooby-doo"
+)
+```
+
+```{r}
+#! eval: false
+vetiver::vetiver_write_docker(v)
+```
+
+Build the Docker container (from command line):
+
+```{bash}
+#! eval: false
+docker build --platform linux/amd64 -t scooby-doo
+```
+
+Run the Docker container (from command line):
+
+```{bash}
+#! eval: false
+docker run --env-file .Renviron --rm -p 8000:8000 scooby-doo
+```
+
+# Predict from a model
+
+Predict for remote vetiver model:
+
+```{r}
+#! eval: false
+# run plumber.R in a different R session
+scooby_endpoint<-vetiver::vetiver_endpoint("http://127.0.0.1:9473/predict")
+scooby_endpoint
+```
+
+```{r}
+new_episodes<-tidyr::crossing(
+  year_aired = sample(1970:2000, size = 3),
+  imdb = sample(5:9, size = 3)
+)
+new_episodes
+```
+
+```{r}
+#! eval: false
+predict(scooby_endpoint, new_episodes)
+```
+
+# Monitor your model
+
+To monitor the statistical properties of your model over time, you will need new data with labels. Let's say that Scooby Doo airs more episodes starting this year:
+
+```{r}
+# arrange because of
+# slide_period()
+# `.i` must be in ascending order
+scooby_validation <- feather::read_feather("data/scooby-validation.arrow")%>%
+  dplyr::arrange(date_aired)
+scooby_validation
+```
+
+We can compute multiple metrics at once over a certain time aggregation.
+
+# How does a model use time?
+
+-   Your model sometimes uses date-time quantities as features for prediction (like these Scooby Doo episodes!).
+-   Monitoring **always** involves a date-time quantity, not necessarily as a feature, but as a dimension along which you are monitoring.
+
+
+```{r}
+# year -> aggregation unit (I'm gonna aggregate on year level)
+scooby_metrics<-parsnip::augment(
+  x = v,
+  new_data = scooby_validation
+)%>%
+  vetiver::vetiver_compute_metrics(date_aired, "year", monster_real, .pred_class)
+
+scooby_metrics
+```
+
+```{r}
+#! fig-width: 8
+#! fig-height: 5
+ggplot(scooby_metrics, aes(x = .index, y = .estimate, fill = .metric))+
+  geom_col(alpha = 0.8, show.legend = FALSE)+
+  facet_wrap(~.metric, scales = "free")+
+  labs(x = NULL, y = NULL)
+```
+
